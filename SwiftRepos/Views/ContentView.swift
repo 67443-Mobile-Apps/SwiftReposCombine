@@ -1,114 +1,63 @@
+// Created by Prof. H in 2026
+// Part of the SwiftRepos project
+// Using Swift 6.0
+// Qapla'
+
 import SwiftUI
 
 struct ContentView: View {
+  // TA NOTE: The view model here is an `ObservableObject` (so it can have
+  // `@Published` publishers for Combine), and `@StateObject` is how a view OWNS
+  // one. The non-Combine SwiftRepos uses `@State` because its view model is
+  // `@Observable`. Don't use `@ObservedObject` here: that's for an object
+  // passed in from outside, and SwiftUI may re-create it on you.
+  @StateObject private var viewModel = RepositoryViewModel()
 
-    // MARK: - Properties
-    // @ObservedObject automatically subscribes to @Published properties in ViewModel
-    // When any @Published property changes, SwiftUI automatically re-renders this view
-    // This is Combine working behind the scenes!
-    @ObservedObject var viewModel = ViewModel()
-
-    // MARK: - Body
-    var body: some View {
-        NavigationView {
-            VStack {
-                // TEACHING NOTE: Notice how simple this is now!
-                // We directly bind to viewModel.searchText
-                // The ViewModel's Combine pipeline handles debouncing and filtering
-                // No manual binding closures needed!
-                TextField("Search repositories...", text: $viewModel.searchText)
-                    .textFieldStyle(RoundedBorderTextFieldStyle())
-                    .padding(.horizontal)
-                    .padding(.top, 5)
-                    .autocapitalization(.none)
-
-                // Show loading indicator when fetching
-                if viewModel.isLoading {
-                    if #available(iOS 14.0, *) {
-                        ProgressView("Loading repositories...")
-                            .padding()
-                    } else {
-                        Text("Loading repositories...")
-                            .foregroundColor(.gray)
-                            .padding()
-                    }
-                }
-
-                // Show error message if there's an error
-                if let errorMessage = viewModel.errorMessage {
-                    Text(errorMessage)
-                        .foregroundColor(.red)
-                        .padding()
-                        .multilineTextAlignment(.center)
-                }
-
-                // TEACHING NOTE: We use filteredRepos directly from ViewModel
-                // Thanks to Combine's combineLatest, this automatically updates
-                // whenever either repos or searchText changes!
-                List(viewModel.filteredRepos) { repository in
-                    NavigationLink(
-                        destination: WebView(request: URLRequest(url: URL(string: repository.htmlURL)!))
-                            .navigationBarTitle(repository.name)
-                    ) {
-                        RepositoryRowView(repository: repository)
-                    }
-                }
-                .navigationBarTitle("Swift Repos", displayMode: .inline)
-
-                Spacer()
-            }
-            // TEACHING NOTE: onAppear calls our Combine-based fetch method
-            // This triggers the entire Combine pipeline in ViewModel
-            .onAppear {
-                viewModel.fetchRepositories()
-            }
+  var body: some View {
+    // TA NOTE: `NavigationStack` (iOS 16+) replaces the deprecated `NavigationView`
+    // you used. It supports "value-based" navigation — see `.navigationDestination`
+    // below. If a student uses NavigationView it will still compile with warnings.
+    NavigationStack {
+      List(viewModel.filteredRepos) { repo in
+        // TA NOTE: `NavigationLink(value:)` is the new value-based form. Instead
+        // of hard-wiring a destination view here, you push a *value* onto the
+        // stack and let `.navigationDestination(for:)` decide how to render it.
+        // Big wins: decouples list rows from destinations, and lets you drive
+        // navigation programmatically by mutating a path binding.
+        NavigationLink(value: repo) {
+          RepositoryRow(repo: repo)
         }
+      }
+      .navigationTitle("Swift Repos")
+      // TA NOTE: This line is the one students will get stuck on. Breakdown:
+      //   - `.searchable` is the modern modifier that gives you a system search
+      //     bar; when you took the course you built this by hand with a
+      //     TextField and a custom Binding<String>.
+      //   - `.searchable` needs a `Binding<String>` (two-way). Because the view
+      //     model is a `@StateObject`, `$viewModel.searchText` gives us one
+      //     directly. (The non-Combine SwiftRepos needs `Bindable(viewModel)`
+      //     here instead, because its view model is @Observable.)
+      //   - As the user types, SwiftUI writes back through the binding into the
+      //     view model's `@Published searchText`, which feeds the Combine
+      //     pipeline, which updates `filteredRepos`, which re-renders the List.
+      .searchable(text: $viewModel.searchText, prompt: "Search repos")
+      // TA NOTE: The other half of value-based navigation. Any Repository pushed
+      // onto the stack via NavigationLink(value:) lands here. `Repository` must
+      // be `Hashable` for this to work — see the note in Repository.swift.
+      .navigationDestination(for: Repository.self) { repo in
+        if let url = URL(string: repo.htmlURL) {
+          WebView(url: url)
+            .navigationTitle(repo.name)
+            .navigationBarTitleDisplayMode(.inline)
+        }
+      }
+      .onAppear {
+        // TA NOTE: The `isEmpty` guard prevents refetching every time the view
+        // reappears (e.g. popping back from the WebView). Cheap way to cache.
+        if viewModel.repos.isEmpty {
+          viewModel.loadRepositories()
+        }
+      }
     }
+  }
 }
-
-// MARK: - Preview
-struct ContentView_Previews: PreviewProvider {
-    static var previews: some View {
-        ContentView()
-    }
-}
-
-
-// MARK: - Teaching Notes for ContentView
-/*
- KEY COMBINE CONCEPTS DEMONSTRATED IN THIS VIEW:
-
- 1. AUTOMATIC UI UPDATES WITH @Published AND @ObservedObject
-    - ViewModel has @Published properties
-    - ContentView uses @ObservedObject to watch the ViewModel
-    - When @Published properties change, SwiftUI automatically re-renders
-    - This is Combine's integration with SwiftUI!
-
- 2. SIMPLIFIED BINDING
-    - Old approach: Complex Binding<String> with get/set closures
-    - New approach: Direct binding with $viewModel.searchText
-    - The ViewModel handles all the Combine logic internally
-
- 3. REACTIVE DATA FLOW
-    - User types → searchText updates → Debounce waits
-    - → ViewModel filters → filteredRepos updates → UI re-renders
-    - All of this happens automatically through Combine!
-
- 4. SEPARATION OF CONCERNS
-    - View: Only responsible for displaying data
-    - ViewModel: Handles all business logic and Combine pipelines
-    - This makes testing and maintenance much easier
-
- 5. NO MANUAL STATE MANAGEMENT
-    - We removed @State var searchField
-    - We removed @State var displayedRepos
-    - We removed loadData() and displayRepos() methods
-    - Everything is handled by ViewModel's Combine pipelines
-
- DISCUSSION QUESTIONS FOR STUDENTS:
- - What happens when you type in the search field?
- - How does the 300ms debounce improve performance?
- - Why don't we need manual state management anymore?
- - How does @ObservedObject know when to update the UI?
- - What's the difference between @State and @ObservedObject?
- */

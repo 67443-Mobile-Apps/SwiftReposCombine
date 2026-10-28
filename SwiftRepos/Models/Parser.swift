@@ -1,105 +1,45 @@
+// Created by Prof. H in 2026
+// Part of the SwiftRepos project
+// Using Swift 6.0
+// Qapla'
+// Updated to use Combine
+
 import Foundation
 import Combine
-
-// MARK: - Custom Errors for Better Error Handling
-enum NetworkError: Error {
-  case invalidURL
-  case invalidResponse
-  case decodingError
-  case networkError(Error)
-
-  var localizedDescription: String {
-    switch self {
-    case .invalidURL:
-      return "The URL is invalid"
-    case .invalidResponse:
-      return "Invalid response from server"
-    case .decodingError:
-      return "Failed to decode the response"
-    case .networkError(let error):
-      return "Network error: \(error.localizedDescription)"
-    }
-  }
-}
+// TA NOTE: Alamofire comes in via Swift Package Manager (see the project's
+// Package Dependencies). If a student's build fails with "no such module
+// 'Alamofire'", first check File > Packages > Reset Package Caches, then that
+// the target has Alamofire in Frameworks & Libraries.
+import Alamofire
 
 class Parser {
+  private let url = "https://api.github.com/search/repositories?q=language:swift&sort=stars&order=desc"
 
-  // MARK: - Properties
-  let urlString = "https://api.github.com/search/repositories?q=language:swift&sort=stars&order=desc"
-
-  // MARK: - Combine-based Network Request
-  // This method demonstrates several key Combine concepts:
-  // 1. Publisher creation with URLSession.dataTaskPublisher
-  // 2. Operator chaining (map, decode, catch)
-  // 3. Thread management with receive(on:)
-  // 4. Type erasure with eraseToAnyPublisher()
-
-  func fetchRepositories() -> AnyPublisher<[Repository], NetworkError> {
-    // Validate URL
-    guard let url = URL(string: urlString) else {
-      return Fail(error: NetworkError.invalidURL)
-        .eraseToAnyPublisher()
-    }
-
-    // Create a dataTaskPublisher - this is a Combine publisher
-    // that wraps URLSession's data task functionality
-    return URLSession.shared.dataTaskPublisher(for: url)
-      // Map operator: Transform the output from (data, response) to just data
-      // This demonstrates the map operator, one of the most common Combine operators
-      .map(\.data)
-      // Decode operator: Automatically decode JSON to our Repositories struct
-      // This shows how Combine integrates with Codable
-      .decode(type: Repositories.self, decoder: JSONDecoder())
-      // Another map to extract just the items array from Repositories
+  // TA NOTE: Compare with the non-Combine SwiftRepos: same request, same
+  // `.validate()`, same Codable decoding — but instead of taking a completion
+  // handler, this *returns a publisher*. Nothing hits the network until someone
+  // subscribes (see `loadRepositories()` in the view model).
+  //   - `publishDecodable(type:)` is Alamofire's Combine twin of
+  //     `responseDecodable(of:)`. It delivers on the main queue by default, so
+  //     no `.receive(on:)` is needed.
+  //   - `.value()` turns the response into a plain stream of `Repositories`
+  //     that fails with `AFError`.
+  //   - `.catch` is the Combine version of the `.failure` case: log the error
+  //     and hand back an empty array. Because errors are handled here, the
+  //     return type's Failure is `Never`.
+  //   - `eraseToAnyPublisher()` hides the long nested operator type from callers.
+  func fetchRepositories() -> AnyPublisher<[Repository], Never> {
+    AF.request(url)
+      .validate()
+      .publishDecodable(type: Repositories.self)
+      .value()
       .map(\.items)
-      // MapError: Convert any errors to our custom NetworkError type
-      // This demonstrates error handling in Combine
-      .mapError { error -> NetworkError in
-        if error is DecodingError {
-          return .decodingError
-        }
-        return .networkError(error)
+      .catch { error -> Just<[Repository]> in
+        // TA NOTE: Deliberately simple — for the lab we just log and hand back
+        // an empty array. In a real app you'd surface the error to the view.
+        print("Error fetching repositories: \(error.localizedDescription)")
+        return Just([])
       }
-      // Receive(on:): Ensure we receive results on the main thread
-      // This is crucial for updating UI from network responses
-      .receive(on: DispatchQueue.main)
-      // EraseToAnyPublisher: Type erasure to simplify the return type
-      // This hides the complex nested type and makes the API cleaner
       .eraseToAnyPublisher()
-  }
-
-  // MARK: - Alternative: Using Subjects for More Control
-  // PassthroughSubject allows manual control over when values are sent
-  private let repositoriesSubject = PassthroughSubject<[Repository], NetworkError>()
-
-  func repositoriesPublisher() -> AnyPublisher<[Repository], NetworkError> {
-    return repositoriesSubject.eraseToAnyPublisher()
-  }
-
-  // This method can be called to manually trigger updates
-  func manualFetch() {
-    guard let url = URL(string: urlString) else {
-      repositoriesSubject.send(completion: .failure(.invalidURL))
-      return
-    }
-
-    URLSession.shared.dataTask(with: url) { [weak self] data, response, error in
-      if let error = error {
-        self?.repositoriesSubject.send(completion: .failure(.networkError(error)))
-        return
-      }
-
-      guard let data = data else {
-        self?.repositoriesSubject.send(completion: .failure(.invalidResponse))
-        return
-      }
-
-      do {
-        let repositories = try JSONDecoder().decode(Repositories.self, from: data)
-        self?.repositoriesSubject.send(repositories.items)
-      } catch {
-        self?.repositoriesSubject.send(completion: .failure(.decodingError))
-      }
-    }.resume()
   }
 }

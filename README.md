@@ -1,143 +1,245 @@
-# Swift Repos Combine
+# SwiftRepos: Callbacks & Observation vs. Combine
 
-This is a version of the SwiftRepos lab exercise, but refactored to use Combine.  Unlike the TempConverterCombine app, I don't have a separate document of changed, but tried to add a lot of comments to the code at places where Combine was used.  Below are the original lab instructions.
+This is a version of the SwiftRepos lab exercise, but refactored to use Combine.  What follows are some notes comparing two versions of the SwiftRepos app:
+
+- **`SwiftRepos/`**: an Alamofire request with a **completion handler**, an **`@Observable`** view model, and a **computed property** for search filtering.
+- **`SwiftReposCombine/`**: the same app with the data flow rewritten in **Combine**. The parser returns a **publisher**, and a **pipeline** keeps the filtered list up to date.
+
+The two projects are a controlled comparison. They share the same Xcode project settings (iOS 17, Swift 6 concurrency defaults), the same Alamofire version, the same models, the same rows, the same `WebView`, the same navigation, and the same four tests. 
+
+**Only these things differ between the two apps:**
+
+| File | What changes |
+|---|---|
+| `Models/Parser.swift` | Completion handler → returns `AnyPublisher` |
+| `ViewModels/RepositoryViewModel.swift` | `@Observable` + computed property → `ObservableObject` + `@Published` + one pipeline |
+| `Views/ContentView.swift` | 2 lines: `@State` → `@StateObject`, and `Bindable(viewModel).searchText` → `$viewModel.searchText` |
+| `SwiftReposTests/RepositoryViewModelTests.swift` | Same four tests; three become `async` and wait for the debounce |
+| Bundle ID | `net.cmuis.SwiftReposCombine`, so both apps can be installed side by side |
+
+We will break down each of these 4 changes in detail in section 2 below, giving you some key ideas on the impact of each change. I have some other teaching notes here and also in comments in the app itself to help you understand what is happening. (*The comments are all "TA Notes" that I had in the original lab to help TAs answer questions I thought might come up. I left them all in here, but modified the ones related to Combine; the entire set could be instructive.*)
 
 ---
 
-## Overview
+## 1. The "Big Idea"
 
-1. In this lab, we will build an application to look at the most popular Swift repisitories on GitHub using the GitHub API and many of the skills we have learned in class. You are allowed and encouraged to use Alamofire and Codable to make it easier to write this lab and to produce cleaner code. The final application will look like this:
+There are two jobs in this app, and each version handles them differently:
 
-   <img src=https://i.imgur.com/cOtGPmp.png?1 width="25%"/>
+| Job | `SwiftRepos` | `SwiftReposCombine` |
+|---|---|---|
+| **Fetch** the repos (one async event) | Call a function and pass a closure to run when the data arrives | Get back a **publisher**; subscribing to it starts the request |
+| **Filter** as the user types (an ongoing stream of changes) | A computed property that SwiftUI re-reads whenever its inputs change | A pipeline that *pushes* a new array into a stored property whenever its inputs change |
 
-## Setup
+### The Big Idea in 2 Sentences:
+What I want you to take away is this: **in modern SwiftUI, Observation already makes the screen reflect the current state** without Combine. Combine earns its place when the logic involves **time** (debounce, throttle, retry) or **combining several streams** of events.
 
-1. Clone the [starter code](https://github.com/67443-Mobile-Apps/swiftrepos_starter).  When you open the project in Xcode and go to `Models/Parser.swift` you see an error because Xcode does not know what `import Alamofire` means.  
+---
 
-1. To solve this problem, first go to Swift Package Index at [https://swiftpackageindex.com/](https://swiftpackageindex.com/) and look up 'Alamofire'.  Click on the 'Use this Package' button and copy the Package URL. (If you want to see the [Alamofire](https://github.com/Alamofire/Alamofire) repo and read more about it, you can click on the 'View on GitHub' link on the right.)
+## 2. Layer by Layer
 
-1. Now to install this dependency in Xcode, we will use Swift Package Manager as it is already baked into Xcode. (The alternative that predates SPM is a Ruby gem called [CocoaPods](https://cocoapods.org/) and you will still see it in widespread use and it will be demo'd in class.)  To do this:
+### 2.1 Networking: `Parser.swift`
 
-    - in Xcode, go to the menu option `File` and select the `Add Packages...` option 
+```swift
+// SwiftRepos — completion handler
+func fetchRepositories(completion: @escaping ([Repository]) -> Void) {
+  AF.request(url)
+    .validate()
+    .responseDecodable(of: Repositories.self) { response in
+      switch response.result {
+      case .success(let container):
+        completion(container.items)
+      case .failure(let error):
+        print("Error fetching repositories: \(error.localizedDescription)")
+        completion([])
+      }
+    }
+}
+```
 
-    - In the modal that pops up, on the far right there is a place to search or enter a package URL.  Paste in the link you got in the prior step and add the package.
+```swift
+// SwiftReposCombine — returns a publisher
+func fetchRepositories() -> AnyPublisher<[Repository], Never> {
+  AF.request(url)
+    .validate()
+    .publishDecodable(type: Repositories.self)
+    .value()
+    .map(\.items)
+    .catch { error -> Just<[Repository]> in
+      print("Error fetching repositories: \(error.localizedDescription)")
+      return Just([])
+    }
+    .eraseToAnyPublisher()
+}
+```
 
-    - Once this completes, you are now ready to use Alamofire.  You can verify that by seeing the previous error `Models/Parser.swift` disappears (and a new one appears).
+Some key points for you (the student) to note:
 
-   
+- **Same request, same `.validate()`, same decoding.** Only the way the result is delivered changes. `publishDecodable(type:)` is Alamofire's Combine version of `responseDecodable(of:)`.
+- **Calling the function doesn't make the request.** The Combine version returns a *description* of the request. Nothing goes over the network until something subscribes, which here is `loadRepositories()`.
+- **`switch response.result` becomes operators.** The `.success` branch becomes `.map(\.items)`. The `.failure` branch becomes `.catch { ... Just([]) }`.
+- **`.value()`** turns Alamofire's full `DataResponse` into a plain stream of decoded values that fails with `AFError`.
+- **`Just`** is a publisher that emits one value and finishes. `.catch` swaps the failed stream for `Just([])`.
+- **`Never` in the return type.** `.catch` handles every error, so the publisher can't fail, and the type says so: `AnyPublisher<[Repository], Never>`. What would the return type be if we removed `.catch`? Answer: `AnyPublisher<[Repository], AFError>`. The caller would then *have to* handle failure, because `sink` without `receiveCompletion:` and `assign(to:)` only work when the failure type is `Never`.
+- **`eraseToAnyPublisher()`** hides a type like `Publishers.Catch<Publishers.Map<AnyPublisher<Repositories, AFError>, [Repository]>, Just<[Repository]>>`. Show the full type once; students will see why erasure exists.
+- **Threading:** Alamofire delivers both the completion handler and the publisher's values on the main queue by default, so neither version needs `.receive(on:)`. If you use `URLSession.dataTaskPublisher` instead you *will* need it.
 
-## Models
+### 2.2 View Model: `RepositoryViewModel.swift`
 
-1. To fix the new error, we need to fix our model in `Repository.swift`. Take note of the simple structure of the model.
+```swift
+// SwiftRepos
+@Observable
+class RepositoryViewModel {
+  var repos: [Repository] = []
+  var searchText: String = ""
 
-2. Here is the [JSON](https://api.github.com/search/repositories?q=language:swift&sort=stars&order=desc) we are going to parse. Look at it and take note of its structure, look at the fields you are going to need. Now make this struct conform to both the `Codable` and `Identifiable` protocols.  Remember that for `Codable` you will need to set up `CodingKeys`. (Refer to the earlier playground from class, but note we made a small change so you can't just copy and paste.)
+  var filteredRepos: [Repository] {
+    guard !searchText.isEmpty else { return repos }
+    return repos.filter { repo in
+      repo.name.localizedCaseInsensitiveContains(searchText)
+    }
+  }
 
-3. Now we need to make a parent struct to hold all these `Repository` objects.  In class we called that `Result` and decoded some other aspects, but now we only care about a having a container to hold our repos, so we will create a new struct called `Repositories` as follows:   
+  @ObservationIgnored private let parser = Parser()
 
-	```swift
-	struct Repositories: Codable {
-	 let items: [Repository]
-	
-	 // make sure this conforms to Codable...
-	}
-	
-	```
+  func loadRepositories() {
+    parser.fetchRepositories { [weak self] repos in
+      self?.repos = repos
+    }
+  }
+}
+```
 
-4. Open up the `Parser.swift` and look over the code there.  Because the network calls via Alamofire is not the main focus of this lab, to save time we are simply giving you a fully working parser.  Note that unlike class, we didn't separate this into two classes (one for parsing, the other for the actual retrieval of data) because this is so simple, but that is normally a good idea.  We aren't necessarily following best practice of splitting out the params because there no opportunity to change them in this simple app; if you want to do this on your own and follow the class example, we certainly encourage you to do so.  
+```swift
+// SwiftReposCombine
+class RepositoryViewModel: ObservableObject {
+  @Published var repos: [Repository] = []
+  @Published var searchText: String = ""
+  @Published private(set) var filteredRepos: [Repository] = []
 
-    I realize most students want to just get through lab as quickly as possible, but I would urge you to take a few minutes to look over the [Alamofire documentation](https://github.com/Alamofire/Alamofire) and learn more how this nifty tool works -- you will certainly need it more when it comes to project time.
+  private let parser = Parser()
 
-
-## View Model
-
-1. Open up the `ViewModel.Swift`.
-
-2. We want changes in our view model to be automatically read by our interface so it can update itself.  For this reason, our view model already conforms to the `ObservableObject` protocol.
-
-3. Now to be an `ObservableObject`, we must have some values with are being 'published' so that other observers can subscribe to and see changes.  I promise we will explain the concept of reactive programming more in lecture soon, but for now we've given you the stubs for three fields that need to be publishable; mark them as published by putting `@Published` in the front of each and set reasonable initial values with the right data types.
-
-    - `repos`: An array of all the `Repository` objects
-    - `searchText`: The search bar text as a `String`
-    - `filteredRepos`: An array of the filtered `Repository` objects
-
-4. Add the following method that will filter the repos:
-
-    ```swift
-      func search(searchText: String) {
-        self.filteredRepos = self.repos.filter { repo in
-          return repo.name.lowercased().contains(searchText.lowercased())
+  init() {
+    $repos
+      .combineLatest(
+        $searchText
+          .debounce(for: .milliseconds(300), scheduler: DispatchQueue.main)
+          .removeDuplicates()
+      )
+      .map { repos, searchText in
+        guard !searchText.isEmpty else { return repos }
+        return repos.filter { repo in
+          repo.name.localizedCaseInsensitiveContains(searchText)
         }
       }
-     ```
+      .assign(to: &$filteredRepos)
+  }
 
-## Views
+  func loadRepositories() {
+    parser.fetchRepositories()
+      .assign(to: &$repos)
+  }
+}
+```
 
-### List Row Cell (`RepositoryRow`)
+The filtering logic in the `.map` closure is **identical** to the computed property. What differs is how and when it runs:
 
-Let's start easy with the SwiftUI file called `RepositoryRow.swift` that basically holds the contents of an individual table cell.  Recall from lecture that a cell displays the repository's `name` (let's make that a `.headline` font) and `itemDescription` (a `.subheadline` font) and these are placed with the name on top and the description below. Note that the struct will need to have a `Repository` that it can reference for these values.
+| | Observation (computed) | Combine (pipeline) |
+|---|---|---|
+| Where the result lives | Nowhere; it's recalculated each time it's read | A stored `@Published var filteredRepos` |
+| When the filter runs | Whenever SwiftUI reads `filteredRepos` | When `repos` changes, or 300 ms after typing stops |
+| What keeps it in sync | SwiftUI notices that `filteredRepos` reads `repos` and `searchText` | `combineLatest` re-emits when either input emits |
+| Who can write it | No one; it's computed | Only the pipeline (`private(set)`) |
 
-Hopefully the code you developed in the class exercise on Tuesday will be helpful to you in that regard.  If you are still having issues with this, [here](https://developer.apple.com/tutorials/swiftui/building-lists-and-navigation) is an excellent resource that will also be helpful for creating the List View.
+More key points for you:
 
-### List View (`ContentView`)
+- **Why not `@Observable` here too?** Combine pipelines start from publishers, and `@Published` is what creates `$repos` and `$searchText`. The `@Observable` macro doesn't generate publishers. So choosing Combine for the pipeline means choosing `ObservableObject` for the view model. The view changes in the next section follow from that.
+- **`$repos` vs. `repos`:** the `$` prefix gives the *publisher* (a stream of values over time). Without it you get the current value.
+- **`combineLatest`** emits a tuple of the latest values whenever *either* input emits. Note that it waits until *both* inputs have emitted at least once.
+- **`debounce` belongs on `searchText` only.** Debouncing the combined stream would delay the list from appearing after the fetch. Debouncing just the text input means typing waits, but new data shows up right away.
+- **`removeDuplicates`** prevents re-filtering when the debounced text hasn't actually changed, for example when someone types a letter and deletes it within 300 ms.
+- **`assign(to: &$property)`** writes each value into a `@Published` property and ties the subscription's lifetime to that property. That's why this version needs **no `Set<AnyCancellable>`, no `.store(in:)` and no `[weak self]`**. Compare it with the TempConverterCombine demo, which uses `sink` + `store(in:)` for side effects.
+- **`loadRepositories()` → `.assign(to: &$repos)`:** subscribing starts the request. When the array arrives, it's assigned to `repos`, which flows through the pipeline in `init` into `filteredRepos`. That's two pipelines chained through a `@Published` property.
+- **`@ObservationIgnored` has no Combine counterpart** because there's nothing to opt out of: an `ObservableObject` only notifies SwiftUI about properties marked `@Published`, and `parser` isn't one.
 
-1. Now time to hit the challenging one: our list of repos in `ContentView.swift`.  There are fields that we'd like to have right at the top of the struct before we even go into `var body` to help us manage the state of our app: 
+### 2.3 View: `ContentView.swift`
 
-    ```swift
-    var searchField: String = ""
-    var displayedRepos = [Repository]()
-    ```
-    As we add things to the search string, our displayed repos should update accordingly.  Oh no.  Houston, we have a problem.  This is a struct (as all SwiftUI views are), not a class, so the state should be immutable and we can't update these values.  To rectify this, we will make them property wrappers by adding `@State` in front of each.  We are now handing over these over to SwiftUI so that it remains persistent in memory as long as the view exists and when the state changes, SwiftUI will automatically reload with the latest changes.
+Only two lines differ:
 
-2. Next we have to get a source of truth for the view, to actually know information from the view model, like those published fields we have there.  Right after our `@State` variables, we need to create an instance of the `ViewModel` and since the view model is an `ObservableObject` then this instance would be an `@ObservedObject` (place that in front, similar to what we did with `@State` above).
+```swift
+// SwiftRepos
+@State private var viewModel = RepositoryViewModel()
+.searchable(text: Bindable(viewModel).searchText, prompt: "Search repos")
 
-3. To update the repos responsively (as the user types), we are going to need to create a custom binding for the `searchField` from the search bar:
+// SwiftReposCombine
+@StateObject private var viewModel = RepositoryViewModel()
+.searchable(text: $viewModel.searchText, prompt: "Search repos")
+```
 
-   ```swift
-     let binding = Binding<String>(get: {
-       self.searchField
-     }, set: {
-       self.searchField = $0
-       self.viewModel.search(searchText: self.searchField)
-       self.displayRepos()
-     })
-   ```
+- **Owning the view model:** an `ObservableObject` is owned with `@StateObject`; an `@Observable` class is owned with `@State`. (`@ObservedObject` is for an object *passed in* from a parent. Using it for an object the view creates can cause SwiftUI to re-create it and lose its data.)
+- **Getting a binding:** a `@StateObject` gives you `$viewModel.searchText` directly. An `@Observable` object needs `Bindable(...)` to produce a binding.
+- Everything else, including the `List`, navigation, and the `repos.isEmpty` guard in `.onAppear`, is the same.
 
-   This goes immediately inside `var body: some View`.
+### 2.4 Tests: `RepositoryViewModelTests.swift`
 
-4. Now this will display an error because we haven't defined a function called `displayRepos()`.  To correct that, go outside the `var body: some View {}` block (but still in the struct) and add the following code:
+Same fixtures, same four tests, same assertions. The one difference:
 
-    ```swift
-    func loadData() {
-      Parser().fetchRepositories { (repos) in
-        self.viewModel.repos = repos
-        self.displayedRepos = repos
-      }
-    }
+```swift
+// SwiftReposCombine
+private func waitForDebounce() async throws {
+  try await Task.sleep(for: .milliseconds(400))
+}
 
-    func displayRepos() {
-      if searchField == "" {
-        displayedRepos = viewModel.repos
-      } else {
-        displayedRepos = viewModel.filteredRepos
-      }
-    }
-    ```
+@Test func searchMatchesSubstring() async throws {
+  let vm = RepositoryViewModel()
+  vm.repos = sampleRepos()
+  vm.searchText = "swift"
+  try await waitForDebounce()          // ← not needed in SwiftRepos
+  #expect(vm.filteredRepos.contains { $0.name == "SwiftLint" })
+  ...
+}
+```
 
-    As a bonus, this will give us a method to load data as well.
+Because `filteredRepos` is computed in `SwiftRepos`, it's correct the moment you read it. In the Combine version, the debounce means it isn't updated until 300 ms after the last change to `searchText`. Even the initial `""` is debounced. So the tests have to wait. **Time-based operators make code time-dependent to test.** In production code you'd usually inject a scheduler so tests can control time instead of sleeping.
 
-5. Now we get to creating the view itself.  Within the `var body: some View {}` block (but after our `binding`, go ahead and return a VStack; the first thing it will have is a `TextField` and in the placeholder `text: Value` replace the value with `binding`.
+---
 
-6. The next thing in our VStack is a `List` that is populated with `RepositoryRow` views as we did in class with PriceCheck.  This list is based off of `displayedRepos`, which can change as the search is activated.  Finally, add the `.navigationBarTitle` to the `List` element so it says "Swift Repos".
+## 3. Some Combine vocabulary used here
 
-7. For the entire VStack, add on `.onAppear(perform: loadData)`. This is updating the `displayedRepos` when the View appears.
+| Concept | Where | What it does |
+|---|---|---|
+| `publishDecodable(type:)` | Parser | Alamofire's Combine API: a publisher of the decoded response |
+| `.value()` | Parser | Turns a response publisher into a stream of values that can fail with `AFError` |
+| `.map(\.items)` | Parser | Key-path `map` that pulls out one field |
+| `.catch` + `Just` | Parser | Replaces a failure with a fallback publisher that emits one value |
+| `AnyPublisher` / `.eraseToAnyPublisher()` | Parser | Hides the nested operator type behind `AnyPublisher<Output, Failure>` |
+| `ObservableObject` / `@Published` | View model | Property publishers (`$repos`, `$searchText`) + SwiftUI change notifications |
+| `.combineLatest` | View model | Emits the latest pair whenever either input emits (after both have emitted once) |
+| `.debounce(for:scheduler:)` | View model | Emits only after the input has been quiet for an interval |
+| `.removeDuplicates()` | View model | Drops a value equal to the previous one |
+| `.assign(to: &$property)` | View model | Subscribes and writes each value into a `@Published` property; manages its own lifetime |
+| `@StateObject` | ContentView | How a view owns an `ObservableObject` |
 
-8. Run the app in a simulator and see that the app displays the repos from the API call and that searching filters out that list.
+---
 
+## 4. Tradeoffs: when to use which
 
-### WebView (`RepositoryDetail`)
+**Callbacks + Observation (`SwiftRepos`)**
 
-This view is given to you. Look it over to see how it works. Now here's the trick: we want to make sure each row in the list (in the `ContentView`) links to the appropriate GitHub repo. (hint: use a `NavigationLink` like we did in class with the destination being `WebView(request: URLRequest(url:URL(string: repository.htmlURL)!)`.)
+- Less code; the filter is a plain property that can't go stale.
+- Easy to test: there's no timing involved.
+- Apple's direction for new SwiftUI code (`@Observable`, and `async/await` for one-shot network calls).
+- Time-based behavior has to be built by hand, e.g., `Task.sleep` inside `.task(id: searchText)`.
 
-If time allows, you can also explore customizing the views more and cleaning up some of the code.  Feel free to explore further--that's where the real fun and learning is!
+**Combine (`SwiftReposCombine`)**
 
-Qapla'
+- Time-based and multi-source logic is a single operator (`debounce`, `combineLatest`, `retry`).
+- Error handling is visible in the types (`Failure`).
+- Network results and user input use the same kind of stream, and can be combined.
+- More concepts to learn: publishers, subscriptions, schedulers, lifetimes.
+- Can't just use the `@Observable` amcro; need to use `@ObservableObject`
+- Timing-based operators make tests time-dependent.
+
+### Rule of thumb:
+If a value is a pure function of the current state, use a computed property. If it depends on **time** or on **several async sources**, a Combine pipeline is often the clearest way to express it.
+
+### Qapla'
